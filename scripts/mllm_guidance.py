@@ -1,6 +1,9 @@
 import argparse, os, sys, glob
 import cv2
+from einops import repeat, rearrange
+from kornia.augmentation import RandomAffine, RandomPerspective
 import torch
+from torchvision.transforms.v2.functional import normalize
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
@@ -21,6 +24,15 @@ from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
+
+from llava.conversation import conv_templates
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
+from llava.constants import (
+    IMAGE_TOKEN_INDEX,
+    DEFAULT_IMAGE_TOKEN,
+    IGNORE_INDEX,
+)
 
 
 # load safety model
@@ -95,6 +107,26 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 
+def preprocess(x_in, num_augmentations=1):
+        augmentations = torch.nn.Sequential(
+            RandomAffine(degrees=15, translate=0.1, p=0.7, padding_mode="border"),
+            RandomPerspective(0.7, p=0.7)
+        )
+
+        x_in = torch.nn.functional.interpolate(
+            x_in, size=(336, 336), mode="bilinear"
+        )
+        x_in = repeat(x_in, "1 c h w -> b c h w", b=num_augmentations)
+        x_in = augmentations(x_in)
+        x_in = ((x_in + 1) / 2).clamp(0, 1)
+        x_in = normalize(
+            x_in,
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+        return x_in
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -157,7 +189,7 @@ def main():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -197,9 +229,9 @@ def main():
         help="rows in the grid (default: n_samples)",
     )
     parser.add_argument(
-        "--scale",
+        "--cfg_scale",
         type=float,
-        default=7.5,
+        default=1.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -231,6 +263,31 @@ def main():
         help="evaluate at this precision",
         choices=["full", "autocast"],
         default="autocast"
+    )
+    parser.add_argument(
+        "--mllm_path",
+        type=str,
+        default="liuhaotian/llava-v1.5-7b",
+    )
+    parser.add_argument(
+        "--instruction",
+        type=str,
+        default="Describe this image.",
+    )
+    parser.add_argument(
+        "--num_augmentations",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--model_base",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--cg_scale",
+        type=float,
+        default=30.0,
     )
     opt = parser.parse_args()
 
@@ -286,63 +343,113 @@ def main():
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
-    with torch.no_grad():
-        with precision_scope("cuda"):
-            with model.ema_scope():
-                tic = time.time()
-                all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
-                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                        samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                         conditioning=c,
-                                                         batch_size=opt.n_samples,
-                                                         shape=shape,
-                                                         verbose=False,
-                                                         unconditional_guidance_scale=opt.scale,
-                                                         unconditional_conditioning=uc,
-                                                         eta=opt.ddim_eta,
-                                                         x_T=start_code)
 
-                        x_samples_ddim = model.decode_first_stage(samples_ddim)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+    tokenizer, mllm, _, max_length = load_pretrained_model(
+        model_path=opt.mllm_path,
+        model_base=opt.model_base,
+        model_name=get_model_name_from_path(opt.mllm_path),
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    mllm.eval()
 
-                        x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+    conv = conv_templates["llava_v1"].copy()
+    conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{opt.instruction}")
+    conv.append_message(conv.roles[1], None)
+    instruction = tokenizer_image_token(
+        conv.get_prompt(),
+        tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    )[:max_length]
+    conv.messages[-1][1] = opt.prompt
+    full = tokenizer_image_token(
+        conv.get_prompt(),
+        tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    )[:max_length]
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+    input_ids = full.unsqueeze(0).to(device)
+    labels = full.clone()
+    labels[: len(instruction)] = IGNORE_INDEX
+    labels = labels.unsqueeze(0).to(device)
+    attention_mask = full.ne(IGNORE_INDEX).unsqueeze(0).to(device)
 
-                        if not opt.skip_save:
-                            for x_sample in x_checked_image_torch:
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                # img = put_watermark(img, wm_encoder)
-                                img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                                base_count += 1
+    with precision_scope("cuda"):
+        with model.ema_scope():
+            tic = time.time()
+            all_samples = list()
+            for n in trange(opt.n_iter, desc="Sampling"):
+                for prompts in tqdm(data, desc="data"):
+                    uc = None
+                    if opt.cfg_scale != 1.0:
+                        uc = model.get_learned_conditioning(batch_size * [""])
+                    if isinstance(prompts, tuple):
+                        prompts = list(prompts)
+                    c = model.get_learned_conditioning(prompts)
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
+                    def cond_fn(x):
+                        x = model.decode_first_stage(x)
+                        x = preprocess(x, opt.num_augmentations)
+                        total_loss = torch.tensor(0.0, device=device)
+                        for i in range(x.shape[0]):
+                            images = x[i].unsqueeze(0)
+                            output = mllm.forward(
+                                input_ids=input_ids,
+                                labels=labels,
+                                attention_mask=attention_mask,
+                                images=images.to(dtype=mllm.dtype),
+                            )
 
-                if not opt.skip_grid:
-                    # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
+                            total_loss += output.loss
+                        
+                        return -opt.cg_scale * total_loss / opt.num_augmentations
 
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    # img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                    grid_count += 1
+                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                        conditioning=c,
+                                                        batch_size=opt.n_samples,
+                                                        shape=shape,
+                                                        verbose=False,
+                                                        unconditional_guidance_scale=opt.cfg_scale,
+                                                        unconditional_conditioning=uc,
+                                                        eta=opt.ddim_eta,
+                                                        x_T=start_code,
+                                                        cond_fn=cond_fn if opt.cg_scale > 0.0 else None)
 
-                toc = time.time()
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+
+                    # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+
+                    x_checked_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
+
+                    if not opt.skip_save:
+                        for x_sample in x_checked_image_torch:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            img = Image.fromarray(x_sample.astype(np.uint8))
+                            img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                            base_count += 1
+
+                    if not opt.skip_grid:
+                        all_samples.append(x_checked_image_torch)
+
+            if not opt.skip_grid:
+                # additionally, save as grid
+                grid = torch.stack(all_samples, 0)
+                grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                grid = make_grid(grid, nrow=n_rows)
+
+                # to image
+                grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                img = Image.fromarray(grid.astype(np.uint8))
+                # img = put_watermark(img, wm_encoder)
+                img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
+                grid_count += 1
+
+            toc = time.time()
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
