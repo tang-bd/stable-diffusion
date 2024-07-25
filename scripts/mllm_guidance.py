@@ -133,11 +133,11 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "--prompt",
+        "--prompts",
         type=str,
         nargs="+",
         default=["a painting of a virus monster playing guitar"],
-        help="the prompt to render"
+        help="the prompts to render"
     )
     parser.add_argument(
         "--outdir",
@@ -237,7 +237,7 @@ def main():
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
-        "--from-file",
+        "--from_file",
         type=str,
         help="if specified, load prompts from this file",
     )
@@ -272,7 +272,7 @@ def main():
         default="liuhaotian/llava-v1.5-7b",
     )
     parser.add_argument(
-        "--instruction",
+        "--instructions",
         type=str,
         nargs='+',
         default=["Describe this image in detail."],
@@ -325,10 +325,18 @@ def main():
     else:
         sampler = DDIMSampler(model)
 
-    if len(opt.instruction) == 1:
-        opt.instruction = opt.instruction * len(opt.prompt)
-    elif len(opt.instruction) != len(opt.prompt):
-        raise ValueError("instruction and prompt must be of the same length")
+    if not opt.from_file:
+        if len(opt.instructions) == 1:
+            all_instructions = [opt.instructions] * len(opt.prompts)
+            all_prompts = [opt.prompts]
+        elif len(opt.instructions) != len(opt.prompts):
+            raise ValueError("instructions and prompt must be of the same length")
+    else:
+        print(f"reading prompts from {opt.from_file}")
+        with open(opt.from_file, "r") as f:
+            data = f.read().splitlines()
+            all_instructions = [opt.instructions] * len(data)
+            all_prompts = [[prompt] for prompt in list(data)]
 
     if opt.stopping_step is None:
         opt.stopping_step = opt.ddim_steps
@@ -363,109 +371,117 @@ def main():
     )
     mllm.eval()
 
-    input_ids_list = []
-    labels_list = []
-    attention_mask_list = []
-    for instruction, prompt in zip(opt.instruction, opt.prompt):
-        conv = conv_templates["llava_v1"].copy()
-        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{instruction}")
-        conv.append_message(conv.roles[1], None)
-        instruction = tokenizer_image_token(
-            conv.get_prompt(),
-            tokenizer,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
-        )[:max_length]
-        conv.messages[-1][1] = prompt
-        full = tokenizer_image_token(
-            conv.get_prompt(),
-            tokenizer,
-            IMAGE_TOKEN_INDEX,
-            return_tensors="pt",
-        )[:max_length]
+    all_input_ids_list = []
+    all_labels_list = []
+    all_attention_mask_list = []
+    for instructions, prompts in zip(all_instructions, all_prompts):
+        input_ids_list = []
+        labels_list = []
+        attention_mask_list = []
+        for instruction, prompt in zip(instructions, prompts):
+            conv = conv_templates["llava_v1"].copy()
+            conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{instruction}")
+            conv.append_message(conv.roles[1], None)
+            instruction = tokenizer_image_token(
+                conv.get_prompt(),
+                tokenizer,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            )[:max_length]
+            conv.messages[-1][1] = prompt
+            full = tokenizer_image_token(
+                conv.get_prompt(),
+                tokenizer,
+                IMAGE_TOKEN_INDEX,
+                return_tensors="pt",
+            )[:max_length]
 
-        input_ids = full.unsqueeze(0)
-        labels = full.clone()
-        labels[: len(instruction)] = IGNORE_INDEX
-        labels = labels.unsqueeze(0)
-        attention_mask = full.ne(IGNORE_INDEX).unsqueeze(0)
-        input_ids_list.append(input_ids)
-        labels_list.append(labels)
-        attention_mask_list.append(attention_mask)
+            input_ids = full.unsqueeze(0)
+            labels = full.clone()
+            labels[: len(instruction)] = IGNORE_INDEX
+            labels = labels.unsqueeze(0)
+            attention_mask = full.ne(IGNORE_INDEX).unsqueeze(0)
+            input_ids_list.append(input_ids)
+            labels_list.append(labels)
+            attention_mask_list.append(attention_mask)
+        all_input_ids_list.append(input_ids_list)
+        all_labels_list.append(labels_list)
+        all_attention_mask_list.append(attention_mask_list)
 
     with precision_scope("cuda"):
         with model.ema_scope():
             tic = time.time()
-            all_samples = list()
-            for n in trange(opt.n_iter, desc="Sampling"):
-                uc = None
-                if opt.cfg_scale != 1.0:
-                    uc = model.get_learned_conditioning([""])
-                c = model.get_learned_conditioning([opt.prompt[0]])
+            for prompts, input_ids_list, labels_list, attention_mask_list in tqdm(zip(all_prompts, all_input_ids_list, all_labels_list, all_attention_mask_list), total=len(all_prompts)):
+                all_samples = list()
+                for n in trange(opt.n_iter, desc="Sampling"):
+                    uc = None
+                    if opt.cfg_scale != 1.0:
+                        uc = model.get_learned_conditioning([""])
+                    c = model.get_learned_conditioning([prompts[0]])
 
-                def cond_fn(x):
-                    x = model.decode_first_stage(x)
-                    x = preprocess(x, opt.num_augmentations)
-                    total_loss = torch.tensor(0.0, device=device)
-                    for input_ids, labels, attention_mask in zip(input_ids_list, labels_list, attention_mask_list):
-                        for i in range(x.shape[0]):
-                            images = x[i].unsqueeze(0)
-                            output = mllm.forward(
-                                input_ids=input_ids.to(device=device),
-                                labels=labels.to(device=device),
-                                attention_mask=attention_mask.to(device=device),
-                                images=images.to(dtype=mllm.dtype),
-                            )
+                    def cond_fn(x):
+                        x = model.decode_first_stage(x)
+                        x = preprocess(x, opt.num_augmentations)
+                        total_loss = torch.tensor(0.0, device=device)
+                        for input_ids, labels, attention_mask in zip(input_ids_list, labels_list, attention_mask_list):
+                            for i in range(x.shape[0]):
+                                images = x[i].unsqueeze(0)
+                                output = mllm.forward(
+                                    input_ids=input_ids.to(device=device),
+                                    labels=labels.to(device=device),
+                                    attention_mask=attention_mask.to(device=device),
+                                    images=images.to(dtype=mllm.dtype),
+                                )
 
-                            total_loss += output.loss
-                    
-                    return -opt.cg_scale * total_loss / opt.num_augmentations / len(input_ids_list)
+                                total_loss += output.loss
+                        
+                        return -opt.cg_scale * total_loss / opt.num_augmentations / len(input_ids_list)
 
-                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                    conditioning=c,
-                                                    batch_size=1,
-                                                    shape=shape,
-                                                    verbose=False,
-                                                    unconditional_guidance_scale=opt.cfg_scale,
-                                                    unconditional_conditioning=uc,
-                                                    eta=opt.ddim_eta,
-                                                    x_T=start_code,
-                                                    cond_fn=cond_fn if opt.cg_scale > 0.0 else None,
-                                                    gradient_noise=opt.gradient_noise,
-                                                    stopping_step=opt.stopping_step,
-                                                    )
+                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                        conditioning=c,
+                                                        batch_size=1,
+                                                        shape=shape,
+                                                        verbose=False,
+                                                        unconditional_guidance_scale=opt.cfg_scale,
+                                                        unconditional_conditioning=uc,
+                                                        eta=opt.ddim_eta,
+                                                        x_T=start_code,
+                                                        cond_fn=cond_fn if opt.cg_scale > 0.0 else None,
+                                                        gradient_noise=opt.gradient_noise,
+                                                        stopping_step=opt.stopping_step,
+                                                        )
 
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                    x_samples_ddim = model.decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                    # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
 
-                x_checked_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
+                    x_checked_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
 
-                if not opt.skip_save:
-                    for x_sample in x_checked_image_torch:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                        base_count += 1
+                    if not opt.skip_save:
+                        for x_sample in x_checked_image_torch:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            img = Image.fromarray(x_sample.astype(np.uint8))
+                            img.save(os.path.join(sample_path, f"{prompts[0]}_{base_count:06}.png"))
+                            base_count += 1
+
+                    if not opt.skip_grid:
+                        all_samples.append(x_checked_image_torch)
 
                 if not opt.skip_grid:
-                    all_samples.append(x_checked_image_torch)
+                    # additionally, save as grid
+                    grid = torch.stack(all_samples, 0)
+                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                    grid = make_grid(grid, nrow=n_rows)
 
-            if not opt.skip_grid:
-                # additionally, save as grid
-                grid = torch.stack(all_samples, 0)
-                grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                grid = make_grid(grid, nrow=n_rows)
-
-                # to image
-                grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                img = Image.fromarray(grid.astype(np.uint8))
-                # img = put_watermark(img, wm_encoder)
-                img.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-                grid_count += 1
+                    # to image
+                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                    img = Image.fromarray(grid.astype(np.uint8))
+                    # img = put_watermark(img, wm_encoder)
+                    img.save(os.path.join(outpath, f'{prompts[0]}-grid-{grid_count:04}.png'))
+                    grid_count += 1
 
             toc = time.time()
 
