@@ -1,7 +1,8 @@
-import argparse, os, sys, glob
+import argparse, os, sys
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import cv2
 from einops import repeat, rearrange
-from kornia.augmentation import RandomAffine, RandomPerspective
+from kornia.augmentation import RandomAffine, RandomPerspective, RandomGaussianNoise
 import torch
 from torchvision.transforms.v2.functional import normalize
 import numpy as np
@@ -15,7 +16,7 @@ from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
 from torch import autocast
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -108,16 +109,17 @@ def check_safety(x_image):
 
 
 def preprocess(x_in, num_augmentations=1):
-        augmentations = torch.nn.Sequential(
-            RandomAffine(degrees=15, translate=0.1, p=0.7, padding_mode="border"),
-            RandomPerspective(0.7, p=0.7)
-        )
-
         x_in = torch.nn.functional.interpolate(
             x_in, size=(336, 336), mode="bilinear"
         )
         x_in = repeat(x_in, "1 c h w -> b c h w", b=num_augmentations)
-        x_in = augmentations(x_in)
+        if num_augmentations > 1:
+            augmentations = torch.nn.Sequential(
+                RandomGaussianNoise(0.1, p=0.5),
+                RandomAffine(degrees=10, translate=0.1, p=0.5, padding_mode="border"),
+                RandomPerspective(0.1, p=0.5),
+            )
+            x_in = augmentations(x_in)
         x_in = ((x_in + 1) / 2).clamp(0, 1)
         x_in = normalize(
             x_in,
@@ -133,8 +135,8 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        nargs="?",
-        default="a painting of a virus monster playing guitar",
+        nargs="+",
+        default=["a painting of a virus monster playing guitar"],
         help="the prompt to render"
     )
     parser.add_argument(
@@ -231,7 +233,7 @@ def main():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.0,
+        default=2.0,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -272,12 +274,13 @@ def main():
     parser.add_argument(
         "--instruction",
         type=str,
-        default="Describe this image.",
+        nargs='+',
+        default=["Describe this image in detail."],
     )
     parser.add_argument(
         "--num_augmentations",
         type=int,
-        default=4,
+        default=8,
     )
     parser.add_argument(
         "--model_base",
@@ -288,6 +291,16 @@ def main():
         "--cg_scale",
         type=float,
         default=30.0,
+    )
+    parser.add_argument(
+        "--gradient_noise",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--stopping_step",
+        type=int,
+        default=None,
     )
     opt = parser.parse_args()
 
@@ -312,6 +325,14 @@ def main():
     else:
         sampler = DDIMSampler(model)
 
+    if len(opt.instruction) == 1:
+        opt.instruction = opt.instruction * len(opt.prompt)
+    elif len(opt.instruction) != len(opt.prompt):
+        raise ValueError("instruction and prompt must be of the same length")
+
+    if opt.stopping_step is None:
+        opt.stopping_step = opt.ddim_steps
+
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
@@ -320,18 +341,7 @@ def main():
     # wm_encoder = WatermarkEncoder()
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
-    batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
+    n_rows = opt.n_rows if opt.n_rows > 0 else 1
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -353,88 +363,96 @@ def main():
     )
     mllm.eval()
 
-    conv = conv_templates["llava_v1"].copy()
-    conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{opt.instruction}")
-    conv.append_message(conv.roles[1], None)
-    instruction = tokenizer_image_token(
-        conv.get_prompt(),
-        tokenizer,
-        IMAGE_TOKEN_INDEX,
-        return_tensors="pt",
-    )[:max_length]
-    conv.messages[-1][1] = opt.prompt
-    full = tokenizer_image_token(
-        conv.get_prompt(),
-        tokenizer,
-        IMAGE_TOKEN_INDEX,
-        return_tensors="pt",
-    )[:max_length]
+    input_ids_list = []
+    labels_list = []
+    attention_mask_list = []
+    for instruction, prompt in zip(opt.instruction, opt.prompt):
+        conv = conv_templates["llava_v1"].copy()
+        conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{instruction}")
+        conv.append_message(conv.roles[1], None)
+        instruction = tokenizer_image_token(
+            conv.get_prompt(),
+            tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        )[:max_length]
+        conv.messages[-1][1] = prompt
+        full = tokenizer_image_token(
+            conv.get_prompt(),
+            tokenizer,
+            IMAGE_TOKEN_INDEX,
+            return_tensors="pt",
+        )[:max_length]
 
-    input_ids = full.unsqueeze(0).to(device)
-    labels = full.clone()
-    labels[: len(instruction)] = IGNORE_INDEX
-    labels = labels.unsqueeze(0).to(device)
-    attention_mask = full.ne(IGNORE_INDEX).unsqueeze(0).to(device)
+        input_ids = full.unsqueeze(0)
+        labels = full.clone()
+        labels[: len(instruction)] = IGNORE_INDEX
+        labels = labels.unsqueeze(0)
+        attention_mask = full.ne(IGNORE_INDEX).unsqueeze(0)
+        input_ids_list.append(input_ids)
+        labels_list.append(labels)
+        attention_mask_list.append(attention_mask)
 
     with precision_scope("cuda"):
         with model.ema_scope():
             tic = time.time()
             all_samples = list()
             for n in trange(opt.n_iter, desc="Sampling"):
-                for prompts in tqdm(data, desc="data"):
-                    uc = None
-                    if opt.cfg_scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
+                uc = None
+                if opt.cfg_scale != 1.0:
+                    uc = model.get_learned_conditioning([""])
+                c = model.get_learned_conditioning([opt.prompt[0]])
 
-                    def cond_fn(x):
-                        x = model.decode_first_stage(x)
-                        x = preprocess(x, opt.num_augmentations)
-                        total_loss = torch.tensor(0.0, device=device)
+                def cond_fn(x):
+                    x = model.decode_first_stage(x)
+                    x = preprocess(x, opt.num_augmentations)
+                    total_loss = torch.tensor(0.0, device=device)
+                    for input_ids, labels, attention_mask in zip(input_ids_list, labels_list, attention_mask_list):
                         for i in range(x.shape[0]):
                             images = x[i].unsqueeze(0)
                             output = mllm.forward(
-                                input_ids=input_ids,
-                                labels=labels,
-                                attention_mask=attention_mask,
+                                input_ids=input_ids.to(device=device),
+                                labels=labels.to(device=device),
+                                attention_mask=attention_mask.to(device=device),
                                 images=images.to(dtype=mllm.dtype),
                             )
 
                             total_loss += output.loss
-                        
-                        return -opt.cg_scale * total_loss / opt.num_augmentations
+                    
+                    return -opt.cg_scale * total_loss / opt.num_augmentations / len(input_ids_list)
 
-                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
-                                                        conditioning=c,
-                                                        batch_size=opt.n_samples,
-                                                        shape=shape,
-                                                        verbose=False,
-                                                        unconditional_guidance_scale=opt.cfg_scale,
-                                                        unconditional_conditioning=uc,
-                                                        eta=opt.ddim_eta,
-                                                        x_T=start_code,
-                                                        cond_fn=cond_fn if opt.cg_scale > 0.0 else None)
+                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                                                    conditioning=c,
+                                                    batch_size=1,
+                                                    shape=shape,
+                                                    verbose=False,
+                                                    unconditional_guidance_scale=opt.cfg_scale,
+                                                    unconditional_conditioning=uc,
+                                                    eta=opt.ddim_eta,
+                                                    x_T=start_code,
+                                                    cond_fn=cond_fn if opt.cg_scale > 0.0 else None,
+                                                    gradient_noise=opt.gradient_noise,
+                                                    stopping_step=opt.stopping_step,
+                                                    )
 
-                    x_samples_ddim = model.decode_first_stage(samples_ddim)
-                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                    x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+                x_samples_ddim = model.decode_first_stage(samples_ddim)
+                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
 
-                    # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+                # x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
 
-                    x_checked_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
+                x_checked_image_torch = torch.from_numpy(x_samples_ddim).permute(0, 3, 1, 2)
 
-                    if not opt.skip_save:
-                        for x_sample in x_checked_image_torch:
-                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                            img = Image.fromarray(x_sample.astype(np.uint8))
-                            img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                            base_count += 1
+                if not opt.skip_save:
+                    for x_sample in x_checked_image_torch:
+                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                        img = Image.fromarray(x_sample.astype(np.uint8))
+                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                        base_count += 1
 
-                    if not opt.skip_grid:
-                        all_samples.append(x_checked_image_torch)
+                if not opt.skip_grid:
+                    all_samples.append(x_checked_image_torch)
 
             if not opt.skip_grid:
                 # additionally, save as grid
