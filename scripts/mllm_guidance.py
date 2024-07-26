@@ -2,7 +2,7 @@ import argparse, os, sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import cv2
 from einops import repeat, rearrange
-from kornia.augmentation import RandomAffine, RandomPerspective, RandomGaussianNoise
+from kornia.augmentation import RandomAffine, RandomGaussianNoise
 import torch
 from torchvision.transforms.v2.functional import normalize
 import numpy as np
@@ -113,11 +113,11 @@ def preprocess(x_in, num_augmentations=1):
             x_in, size=(336, 336), mode="bilinear"
         )
         x_in = repeat(x_in, "1 c h w -> b c h w", b=num_augmentations)
+        x_out = x_in.clone()
         if num_augmentations > 1:
             augmentations = torch.nn.Sequential(
-                RandomGaussianNoise(0.1, p=0.5),
-                RandomAffine(degrees=10, translate=0.1, p=0.5, padding_mode="border"),
-                RandomPerspective(0.1, p=0.5),
+                RandomGaussianNoise(mean=0.0, std=0.01),
+                RandomAffine(degrees=10, translate=0.1),
             )
             x_in = augmentations(x_in)
         x_in = ((x_in + 1) / 2).clamp(0, 1)
@@ -126,7 +126,7 @@ def preprocess(x_in, num_augmentations=1):
             mean=[0.48145466, 0.4578275, 0.40821073],
             std=[0.26862954, 0.26130258, 0.27577711]
         )
-        return x_in
+        return x_out
 
 
 def main():
@@ -233,7 +233,7 @@ def main():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=2.0,
+        default=2.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
@@ -275,12 +275,14 @@ def main():
         "--instructions",
         type=str,
         nargs='+',
-        default=["Describe this image in detail."],
+        default=[
+            "Describe the following image in detail.",
+        ],
     )
     parser.add_argument(
         "--num_augmentations",
         type=int,
-        default=8,
+        default=16,
     )
     parser.add_argument(
         "--model_base",
@@ -329,6 +331,9 @@ def main():
         if len(opt.instructions) == 1:
             all_instructions = [opt.instructions] * len(opt.prompts)
             all_prompts = [opt.prompts]
+        elif len(opt.prompts) == 1:
+            all_instructions = [opt.instructions]
+            all_prompts = [opt.prompts * len(opt.instructions)]
         elif len(opt.instructions) != len(opt.prompts):
             raise ValueError("instructions and prompt must be of the same length")
     else:
