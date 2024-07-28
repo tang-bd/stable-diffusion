@@ -76,7 +76,6 @@ class DDIMSampler(object):
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
                cond_fn=None,
-               gradient_noise=0.0,
                stopping_step=0,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
@@ -111,7 +110,6 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     cond_fn=cond_fn,
-                                                    gradient_noise=gradient_noise,
                                                     stopping_step=stopping_step
                                                     )
         return samples, intermediates
@@ -122,7 +120,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      cond_fn=None, gradient_noise=0.0, stopping_step=0):
+                      cond_fn=None, stopping_step=0):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -158,7 +156,7 @@ class DDIMSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      cond_fn=cond_fn, gradient_noise=gradient_noise, cg=(stopping_step >= i))
+                                      cond_fn=cond_fn, cg=(stopping_step >= i))
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -173,7 +171,7 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, cond_fn=None,
-                      gradient_noise=0.0, cg=False):
+                      cg=False):
         b, *_, device = *x.shape, x.device
 
         x = x.detach().requires_grad_(True)
@@ -208,7 +206,7 @@ class DDIMSampler(object):
             x_in = pred_x0 * fac + x * (1 - fac)
             alpha_bar = extract_into_tensor(self.model.alphas_cumprod, t, x.shape)
 
-            gradients = torch.autograd.grad(cond_fn(x_in), x)[0] + torch.randn_like(x) * gradient_noise
+            gradients = torch.autograd.grad(cond_fn(x_in), x)[0]
             e_t = e_t - (1 - alpha_bar).sqrt() * gradients
         # updated prediction for x_0
         pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
