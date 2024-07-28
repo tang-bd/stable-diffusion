@@ -9,7 +9,6 @@ import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
-# from imwatermark import WatermarkEncoder
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
@@ -26,14 +25,10 @@ from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
 
-from llava.conversation import conv_templates
-from llava.model.builder import load_pretrained_model
-from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
-from llava.constants import (
-    IMAGE_TOKEN_INDEX,
-    DEFAULT_IMAGE_TOKEN,
-    IGNORE_INDEX,
-)
+from cambrian.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, IGNORE_INDEX
+from cambrian.conversation import conv_templates
+from cambrian.model.builder import load_pretrained_model
+from cambrian.mm_utils import tokenizer_image_token, get_model_name_from_path
 
 
 # load safety model
@@ -108,25 +103,17 @@ def check_safety(x_image):
     return x_checked_image, has_nsfw_concept
 
 
-def preprocess(x_in, num_augmentations=1):
-        x_in = torch.nn.functional.interpolate(
-            x_in, size=(336, 336), mode="bilinear"
-        )
+def preprocess(x_in, image_processors, num_augmentations=1):
         x_in = repeat(x_in, "1 c h w -> b c h w", b=num_augmentations)
-        x_out = x_in.clone()
         if num_augmentations > 1:
             augmentations = torch.nn.Sequential(
-                RandomGaussianNoise(mean=0.0, std=0.01),
-                RandomAffine(degrees=10, translate=0.1),
+                RandomGaussianNoise(0.0, 1.0),
+                RandomAffine(degrees=(0, 20), translate=(0.1, 0.1), scale=(0.8, 0.9)),
             )
             x_in = augmentations(x_in)
         x_in = ((x_in + 1) / 2).clamp(0, 1)
-        x_in = normalize(
-            x_in,
-            mean=[0.48145466, 0.4578275, 0.40821073],
-            std=[0.26862954, 0.26130258, 0.27577711]
-        )
-        return x_out
+        x_in = [torch.nn.functional.interpolate(normalize(x_in, mean=processor.image_mean, std=[0.26862954, 0.26130258, 0.27577711]), (processor.crop_size["height"], processor.crop_size["width"]), mode="bilinear") for processor in image_processors]
+        return x_in
 
 
 def main():
@@ -269,14 +256,14 @@ def main():
     parser.add_argument(
         "--mllm_path",
         type=str,
-        default="liuhaotian/llava-v1.5-7b",
+        default="nyu-visionx/cambrian-8b",
     )
     parser.add_argument(
         "--instructions",
         type=str,
         nargs='+',
         default=[
-            "Describe the following image in detail.",
+            "Describe this image in detail.",
         ],
     )
     parser.add_argument(
@@ -293,11 +280,6 @@ def main():
         "--cg_scale",
         type=float,
         default=30.0,
-    )
-    parser.add_argument(
-        "--gradient_noise",
-        type=float,
-        default=0.0,
     )
     parser.add_argument(
         "--stopping_step",
@@ -349,11 +331,6 @@ def main():
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
-    # print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    # wm = "StableDiffusionV1"
-    # wm_encoder = WatermarkEncoder()
-    # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
-
     n_rows = opt.n_rows if opt.n_rows > 0 else 1
 
     sample_path = os.path.join(outpath, "samples")
@@ -367,12 +344,10 @@ def main():
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
 
-    tokenizer, mllm, _, max_length = load_pretrained_model(
+    tokenizer, mllm, image_processors, max_length = load_pretrained_model(
         model_path=opt.mllm_path,
         model_base=opt.model_base,
         model_name=get_model_name_from_path(opt.mllm_path),
-        torch_dtype=torch.float16,
-        device_map="auto",
     )
     mllm.eval()
 
@@ -384,18 +359,24 @@ def main():
         labels_list = []
         attention_mask_list = []
         for instruction, prompt in zip(instructions, prompts):
-            conv = conv_templates["llava_v1"].copy()
-            conv.append_message(conv.roles[0], f"{DEFAULT_IMAGE_TOKEN}\n{instruction}")
-            conv.append_message(conv.roles[1], None)
+            template = conv_templates["llama_3"].copy()
+            conv = [
+                {"role": "system", "content": template.system},
+                {"role": "user", "content": f"{DEFAULT_IMAGE_TOKEN}\n{instruction}"},
+            ]
             instruction = tokenizer_image_token(
-                conv.get_prompt(),
+                tokenizer.apply_chat_template(
+                    conv, tokenize=False, add_generation_prompt=True
+                ),
                 tokenizer,
                 IMAGE_TOKEN_INDEX,
                 return_tensors="pt",
             )[:max_length]
-            conv.messages[-1][1] = prompt
+            conv.append({"role": "assistant", "content": prompt})
             full = tokenizer_image_token(
-                conv.get_prompt(),
+                tokenizer.apply_chat_template(
+                    conv, tokenize=False, add_generation_prompt=False
+                ),
                 tokenizer,
                 IMAGE_TOKEN_INDEX,
                 return_tensors="pt",
@@ -426,16 +407,17 @@ def main():
 
                     def cond_fn(x):
                         x = model.decode_first_stage(x)
-                        x = preprocess(x, opt.num_augmentations)
+                        x_in = preprocess(x, image_processors, opt.num_augmentations)
                         total_loss = torch.tensor(0.0, device=device)
                         for input_ids, labels, attention_mask in zip(input_ids_list, labels_list, attention_mask_list):
-                            for i in range(x.shape[0]):
-                                images = x[i].unsqueeze(0)
+                            for i in range(x_in[0].shape[0]):
+                                images = [x_in[j][i].unsqueeze(0).to(dtype=mllm.dtype) for j in range(len(x_in))]
                                 output = mllm.forward(
                                     input_ids=input_ids.to(device=device),
                                     labels=labels.to(device=device),
                                     attention_mask=attention_mask.to(device=device),
-                                    images=images.to(dtype=mllm.dtype),
+                                    images=images,
+                                    image_sizes=[(opt.H, opt.W)],
                                 )
 
                                 total_loss += output.loss
@@ -453,7 +435,6 @@ def main():
                                                         eta=opt.ddim_eta,
                                                         x_T=start_code,
                                                         cond_fn=cond_fn if opt.cg_scale > 0.0 else None,
-                                                        gradient_noise=opt.gradient_noise,
                                                         stopping_step=opt.stopping_step,
                                                         )
 
